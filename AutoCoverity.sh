@@ -3,7 +3,7 @@
 # ===== 第一部分：准备环境 =====
 TMP_DIR=$(pwd)
 # 你需要针对本地环境修改的项
-COVERITY_DIR="$HOME/cov-analysis-linux64-2023.9.0" # 你的coverity目录
+COVERITY_DIR="$HOME/cov-analysis-linux64" # 你的coverity目录
 BASE_DIR="$HOME/diskxxx/namexxx/parent" # 父仓库目录
 PARENT_REPO_DIR="$BASE_DIR"  # 显式定义父工程目录
 PROJECTS="childa childb childc childd childe" # 子工程列表，列出所有子仓库的名字
@@ -11,13 +11,13 @@ COVERITY_OUTPUT_BASE="$HOME/diskxxx/namexxx/coverity-output" # 过程文件存�
 COV_SERVER_URL="http://192.168.001.001:0123" # 你的coverity服务器地址
 COV_USER="CoverityAccount"
 COV_PROJECT="ProjectName"
-# COV_PASS_FILE="$BASE_DIR/.coverity_pass" # 可以将密码存放在本地文件
+COV_PASS_FILE="$BASE_DIR/.coverity_pass" # 可以将密码存放在本地文件
 # 检查密码文件是否存在
-# if [ ! -f "$COV_PASS_FILE" ]; then
-#     echo "error: Coverity 密码文件不存在: $COV_PASS_FILE"
-#     echo "请创建包含密码的文件并设置权限: chmod 600 $COV_PASS_FILE"
-#     exit 1
-# fi
+if [ ! -f "$COV_PASS_FILE" ]; then
+    echo "error: Coverity 密码文件不存在: $COV_PASS_FILE"
+    echo "请创建包含密码的文件并设置权限: chmod 600 $COV_PASS_FILE"
+    exit 1
+fi
 
 COV_BUILD="$COVERITY_DIR/bin/cov-build" # build命令
 COV_ANALYZE="$COVERITY_DIR/bin/cov-analyze" # analyze命令
@@ -88,16 +88,110 @@ run_coverity() {
         # 生成HTML报告到父工程目录;本地备份
         local PROJECT_HTML_DIR="$REPORT_DIR/$project"
         mkdir -p "$PROJECT_HTML_DIR"
-        $COV_FORMAT --dir "$COVERITY_BUILD_DIR" --html-output "$PROJECT_HTML_DIR" # 当前存在问题,但不影响远程推送暂不修改
+        $COV_FORMAT --dir "$COVERITY_BUILD_DIR" --html-output "$PROJECT_HTML_DIR" # 当前可能存在问题,但不影响远程推送暂不修改
+
+        # ===== 第三部分：commit =====
+        # echo "\n<<<<< <<<<< <<<<< <<<<< <<<<< <<<<< <<<<< coverity commiting all >>>>> >>>>> >>>>> >>>>> >>>>> >>>>> >>>>>"
+        cd "$PARENT_REPO_DIR" || { echo "无法进入父工程目录"; exit 1; }
+
+        REPORT_CHANGED=0
+        if [ -n "$(git ls-files --other --directory "$REPORT_DIR")" ] || \
+        [ -n "$(git diff --name-only "$REPORT_DIR")" ]; then
+            REPORT_CHANGED=1
+        fi
+        if [ $REPORT_CHANGED -eq 0 ]; then
+            echo "Report directory has not changed, skipping commit."
+        else
+            read -p "是否提交报告到Git本地仓库?(y/n) " COMMIT_ANSWER
+            case "$COMMIT_ANSWER" in
+                [Yy]*)
+                    # 添加所有报告
+                    git add "$REPORT_DIR"
+                    git commit -m "[Coverity] 各仓库静态分析报告 - $(date +'%Y%m%d_%H%M%S')"
+                    read -p "是否推送报告到远程仓库？(y/n) " PUSH_ANSWER
+                    case "$PUSH_ANSWER" in
+                        [Yy]*) 
+                            git push #origin
+                            echo "Pushed to remote branch"
+                            ;;
+                        *)
+                            echo "Push skipped" 
+                            echo "Local submission has been created, which can be pushed manually later"
+                            ;;
+                    esac
+                    ;;
+                *)
+                    echo "Submission skipped"
+                    ;;
+            esac
+        fi
     else
         echo "关闭本地报告生成"
     fi
 
+    echo "\n<<<<< <<<<< <<<<< <<<<< <<<<< <<<<< <<<<< [5/5] Coverity提交: $project >>>>> >>>>> >>>>> >>>>> >>>>> >>>>> >>>>>\n"
+    local SUBMIT_LOG="$PROJECT_LOG_DIR/submit_$(date +%Y%m%d_%H%M%S).log"
+    {
+        echo "===== 提交到 Coverity 服务器 ====="
+        echo "时间: $(date)"
+        echo "项目: $COV_PROJECT"
+        echo "流: $COV_STREAM"
+        $COV_COMMIT \
+            --dir "$COVERITY_BUILD_DIR" \
+            --url "$COV_SERVER_URL" \
+            --user "$COV_USER" \
+            --password-file "$COV_PASS_FILE" \
+            --stream "$COV_STREAM" \
+            --description "自动提交: $project - $(date +'%Y-%m-%d %H:%M')"
+            
+        SUBMIT_STATUS=$?
+    } > "$SUBMIT_LOG" 2>&1
 
-
-
+    if [ $SUBMIT_STATUS -eq 0 ]; then
+        echo "时间: $(date)"
+        echo "项目: $project"
+        echo "流: $COV_STREAM"
+        echo "Submitted successfully!"
+    else
+        echo "时间: $(date)"
+        echo "Submission failed! 最后5行日志:"
+        tail -n 5 "$SUBMIT_LOG"
+        echo "完整日志: $SUBMIT_LOG"
+        status=1
+    fi
 
     return $status
 }
+
+
+echo "========================================== 开始Coverity批量处理 ======================================"
+echo "项目列表: $PROJECTS"
+echo "工程目录: $BASE_DIR"
+echo "报告目录: $REPORT_DIR"
+echo "Coverity版本: $COVERITY_DIR"
+echo "Coverity流映射:"
+echo "  childa -> ProjectName-childa"
+echo "  ---    -> ---               “
+echo "  ---    -> ---               “
+echo "Cov-build输出目录: $COVERITY_OUTPUT_BASE"
+echo "======================================================================================================"
+
+for project in $PROJECTS; do
+    COUNT=$((COUNT + 1))
+    echo "\n *************************"
+    echo " * 处理项目 ($COUNT/$TOTAL_PROJECTS): $project"
+    echo " *************************"
+    run_coverity "$project"
+    if [ $? -ne 0 ]; then
+        echo "警告: 项目 $project 处理过程中出错"
+        read -p "是否继续处理下一个项目?(y/n) " CONTINUE_ANSWER
+        case "$CONTINUE_ANSWER" in
+            [Nn]*) 
+                echo "终止处理流程"
+                exit 1;;
+        esac
+    fi
+done
+
 
 echo "\n <<< <<< <<< coverity end >>> >>> >>> \n"
